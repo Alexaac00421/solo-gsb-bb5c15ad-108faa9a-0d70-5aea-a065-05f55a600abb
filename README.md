@@ -11,7 +11,9 @@
 - **管理员（admin）**：维护供电网络 —— 新增 / 删除 / 重命名电源、开关、设备，
   启用 / 停用电源，架设或拆除有向供电关系（边）。
 - **操作员（operator）**：开关分闸、合闸、挂牌、解牌；为设备申请 / 结束检修许可；
-  编排并执行**临时操作单**（分闸 → 挂牌 → 申请许可的有序成套操作，支持预演）。
+  编排并执行**临时操作单**（分闸 → 挂牌 → 申请许可的有序成套操作，支持预演）；
+  检修结束时编排并执行**临时复电单**（先结束许可 → 再解牌 → 合闸的有序成套操作，
+  支持预演）。
 
 ### 开关状态机
 1. 合闸位置的开关必须先 **分闸（open）** 才能 **挂牌（tag）**；
@@ -88,6 +90,41 @@ HTTP API）临时编排一张操作单：
   成功时整单**只递增一次修订号**，审计只写**一条** `order.confirm` 记录，
   `detail.steps` 为有序执行清单，`state_before` / `state_after` 为整单前后完整快照。
 - 操作单本身是浏览器 / 请求里的临时编排，**不建表、不落库**。
+
+### 临时复电单（检修结束 — 编排 — 预演 — 确认）
+检修结束、恢复送电时，操作员可在浏览器“检修许可”页（或调用 HTTP API）临时编排一张
+**复电单**：先按序**结束指定的有效许可**，再对选定开关**解牌（untag）、合闸（close）**。
+
+- 步骤按序填写，动作仅支持 `endPermit`（结束许可，给 `permit_id`）、`untag`（解牌）、
+  `close`（合闸，给开关 `node_id`）。**结束许可步必须全部排在解牌 / 合闸步之前**；
+  一张复电单内同一张许可只能结束一次；步数沿用以有操作单上限（200 步）。
+- **结构校验即明确拒绝**：引用**不存在**的许可返回 `404 PERMIT_NOT_FOUND`，
+  **已结束**的许可返回 `422 PERMIT_NOT_ACTIVE`，单内**重复结束**返回
+  `400 PERMIT_END_DUPLICATE`，开关步之后再结束许可返回 `400 END_PERMIT_FIRST`；
+  开关不存在返回 `404`，非正整数编号、空单、非法动作（复电单不允许分闸 / 挂牌 /
+  申请许可）返回 `400`，超过 200 步返回 `400 STEPS_TOO_LONG`。
+- **预演**（`POST /api/restore-orders/preview`）纯只读：逐步展示动作、**前后状态**
+  （结束许可步展示 `active → ended`，开关步展示分合位 / 挂牌位前后值）、
+  成功 / 失败 / 未执行与失败原因；每个开关步后附**剩余有效许可**的隔离结论
+  （`remainingPermits`：许可编号、设备、是否隔离，带电时附真实带电路径与截断标记），
+  响应另附执行前的全部有效许可基线 `remainingPermits` 与本单拟结束的
+  `ended_permit_ids`。预演**不改变真实开关、许可、修订号或审计**，响应携带所依据的
+  当前 `revision`。
+- **确认**（`POST /api/restore-orders/confirm`）在 `IMMEDIATE` 事务、修订号校验通过后
+  按**原顺序逐步校验执行**：结束许可 → 解牌 / 合闸，每一步都遵守现有开关状态机
+  （挂牌开关不得合闸 `SWITCH_TAGGED`、未挂牌不得解牌 / 合闸位不得合闸
+  `INVALID_STATE`）与**剩余有效许可隔离保护**。**任一步使剩余有效许可出现带电通路，
+  即在该步中止**，返回受影响许可（`violations[]`）与每个许可**至少一条真实带电路径**
+  （`livePaths`，完整可达性 BFS 见证路径，不受诊断枚举上限影响）及截断标记，
+  **整单回滚、不落库**；**后续步骤不能补救前一步**（例：先解牌使许可带电，
+  后续再合闸 / 解牌无济于事，全部标记 skipped）。
+- 确认沿用现有 `actor` / `role`（**仅 `operator`**）/ `revision` 及
+  **`STALE_REVISION`** 约定：预演后版本被他人改变，确认返回 `409` 与**当前完整状态**，
+  核对后重试；成功时整单**只递增一次修订号**，审计只写**一条** `restoreOrder.confirm`
+  记录，`detail.steps` 为有序执行清单（含结束许可步的 `permit_id`/`device_id` 与
+  开关步的 `node_id`），`state_before` / `state_after` 为整单前后完整快照。
+- 复电单本身同样是浏览器 / 请求里的临时编排，**不建表、不落库**；仅含结束许可步
+  （不含任何开关步）的复电单也允许确认。
 
 ### 隔离建议（最少新增挂牌）
 操作员在“供电网络”页选择设备后可查看**基于当前修订号**的隔离建议，也可直接调用
@@ -251,6 +288,11 @@ cp .env.example .env
    检查的许可（默认全部）并生成报告：逐已挂牌开关假设其挂牌失效，红色条目
    列出将失去隔离的许可与一条真实带电路径（点击可在网络图中高亮），绿色
    条目为无单点风险的开关；报告携带所依据修订号，只读不改状态。
+   页面下方的“**临时复电单**”用于检修结束恢复送电：先逐行加入“结束许可”
+   （也可直接点许可卡片上的“加入复电单”），全部许可步之后再加入“解牌 / 合闸”
+   开关步（可上下调整顺序、删除）；点“预演”查看每步前后状态、失败位置及剩余
+   有效许可的隔离结果（只读不改状态），预演通过后点“确认执行”，整单原子落库、
+   修订号 +1；任一步使尚未结束的许可带电会在该步中止并高亮带电路径，整单回滚。
 5. **拓扑管理** 页（管理员）：维护节点和有向供电关系。
    规则：电源只能作起点、设备只能作终点、不允许自环和重复接线。
 6. **变更记录** 页：查看所有成功变更的时间、操作者、动作、前后修订号，
@@ -298,6 +340,8 @@ cp .env.example .env
 | POST | `/api/permits/:id/end` | operator | 结束许可 |
 | POST | `/api/orders/preview` | operator | 临时操作单**预演**（只读，不校验/改变修订号）`{steps:[...]}` |
 | POST | `/api/orders/confirm` | operator | 临时操作单**确认执行**（原子，revision +1）`{steps:[...]}` |
+| POST | `/api/restore-orders/preview` | operator | 临时复电单**预演**（只读，不校验/改变修订号）`{steps:[...]}`：先结束许可、再解牌/合闸 |
+| POST | `/api/restore-orders/confirm` | operator | 临时复电单**确认执行**（原子，revision +1，一条审计）`{steps:[...]}` |
 
 错误约定：`400` 参数错误 / `403` 角色不允许 / `404` 不存在 /
 `409 STALE_REVISION` 修订号过期（响应含 `current` 当前状态）/
@@ -367,6 +411,90 @@ curl -s -X POST http://localhost:3000/api/orders/confirm \
 
 预演请求也需带 `actor` 与 `role:operator`（仅做身份展示与鉴权），但 `revision`
 不参与校验——预演永远基于当前状态推演。
+
+#### 临时复电单 API 示例
+
+步骤对象：结束许可步 `{"action":"endPermit","permit_id":1}`；
+开关步 `{"action":"untag|close","node_id":3}`（仅支持解牌、合闸；结束许可步必须在最前）。
+
+```bash
+# 0) 前置状态: K1(3)、K2(4) 已分闸挂牌, 1#循环水泵(6) 持有有效许可 #1(修订号 6)
+
+# 1) 预演: 结束许可 #1 → K2 解牌 → K1 解牌 → K1 合闸 → K2 合闸(只读, 不改状态)
+curl -s -X POST http://localhost:3000/api/restore-orders/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "actor": "张三", "role": "operator", "revision": 6,
+    "steps": [
+      {"action":"endPermit","permit_id":1},
+      {"action":"untag","node_id":4}, {"action":"untag","node_id":3},
+      {"action":"close","node_id":3},  {"action":"close","node_id":4}
+    ]
+  }'
+# -> { ok:true, kind:"restoreOrder.preview", revision:6, success:true, failedStep:null,
+#      remainingPermits:[ {permit_id:1, device_id:6, device_name:"1#循环水泵", isolated:true} ],
+#      ended_permit_ids:[1],
+#      steps:[
+#        {step:1, action:"endPermit", permit_id:1, device_id:6, ok:true,
+#         before:{status:"active"}, after:{status:"ended"},
+#         remainingPermits:[], ...},
+#        {step:2, action:"untag", node_id:4, ok:true,
+#         before:{open_pos:true,tagged:true}, after:{open_pos:true,tagged:false},
+#         remainingPermits:[], ...},
+#        ... ] }
+# 预演不写任何数据; failedStep 非空时该步含 error, 其后各步 skipped:true。
+# 每步 remainingPermits 为“该步落地后”仍有效的许可隔离结论; 带电时含 livePaths。
+
+# 反例预演: 许可仍有效时先解 K2(4) → 该步 ISOLATION_VIOLATION, 后续步 skipped
+# -> { success:false, failedStep:1,
+#      steps:[ {step:1, action:"untag", ok:false,
+#               error:{code:"ISOLATION_VIOLATION", ...},
+#               violations:[{permit_id:1, device_id:6, device_name:"1#循环水泵",
+#                            livePaths:[{nodes:[2#备用电源 → K2 → K3 → 1#循环水泵], ...}],
+#                            truncated:{...}}],
+#               remainingPermits:[{permit_id:1, isolated:true, ...}]},   # 失败步不落地
+#             {step:2, ..., skipped:true} ] }
+
+# 2) 确认执行: 携带所见 revision; 成功整单只 +1 并写一条 restoreOrder.confirm 审计
+curl -s -X POST http://localhost:3000/api/restore-orders/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "actor": "张三", "role": "operator", "revision": 6,
+    "steps": [
+      {"action":"endPermit","permit_id":1},
+      {"action":"untag","node_id":4}, {"action":"untag","node_id":3},
+      {"action":"close","node_id":3},  {"action":"close","node_id":4}
+    ]
+  }'
+# -> 200 { ok:true, action:"restoreOrder.confirm", revision:7,
+#         ended_permit_ids:[1],
+#         steps:[{step:1,action:"endPermit",permit_id:1,device_id:6},
+#                {step:2,action:"untag",node_id:4}, ...,
+#                {step:5,action:"close",node_id:4}],
+#         snapshot:{...当前完整状态...} }
+#
+# 任一步失败 -> 422 { ok:false, step:2, step_name:"解牌",
+#                     error:{code:"ISOLATION_VIOLATION",message:"第 2 步执行失败: ..."},
+#                     step_results:[...各步结果...], ended_permit_ids:[1],
+#                     violations:[{permit_id:1, livePaths:[...真实带电路径...], truncated:{...}}] }
+# 整单回滚不落库(许可仍有效、开关状态不变)。
+#
+# 结构类拒绝:
+#   {"action":"endPermit","permit_id":999}      -> 404 PERMIT_NOT_FOUND      (许可不存在)
+#   对已结束许可再次 endPermit                   -> 422 PERMIT_NOT_ACTIVE
+#   同单内重复 endPermit 同一 permit_id          -> 400 PERMIT_END_DUPLICATE
+#   先 untag/close 后再 endPermit                -> 400 END_PERMIT_FIRST
+#   {"action":"open","node_id":3} / tag / permit -> 400 INVALID_ACTION       (复电单仅 endPermit/untag/close)
+#   201 步                                       -> 400 STEPS_TOO_LONG
+# 修订号过期 -> 409 STALE_REVISION + current(当前完整状态)。
+```
+
+浏览器中的用法：进入“检修许可”页底部的“临时复电单”：选择“结束许可”和目标许可逐行
+加入（或直接点有效许可卡片上的“加入复电单”），再选“解牌 / 合闸”及目标开关加入
+（结束许可步会被自动保持在开关步之前）；点“预演”查看每步前后状态、失败位置与剩余
+有效许可的隔离结论，确认通过后点“确认执行”。失败时结果区给出失败步骤、原因与真实
+带电路径（点击结果可在网络图中高亮），整单回滚、修订号不变。
+
 
 #### 隔离建议 API 示例
 
@@ -519,6 +647,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 │   ├── advisor.js          # 单设备/多设备隔离建议: 最小新增挂牌点割(拆点 + Dinic)
 │   ├── tagrisk.js          # 单点挂牌失效风险: 逐挂牌开关假设失效的完整可达性分析
 │   ├── orders.js           # 临时操作单: 结构校验 + 纯内存预演 + 按序原子提交
+│   ├── restore.js          # 临时复电单: 先结束许可再解牌合闸, 结构校验 + 预演 + 原子提交
 │   └── init-db.js          # 建库脚本(npm run init-db)
 ├── public/                 # 浏览器界面(原生 JS + SVG)
 │   ├── index.html
@@ -527,6 +656,7 @@ curl -s -X POST http://localhost:3000/api/isolation-group/confirm \
 └── test/
     ├── smoke.js            # 端到端业务规则冒烟测试(HTTP)
     ├── orders.e2e.js       # 临时操作单预演/确认/原子回滚/STALE_REVISION 的 HTTP 回归
+    ├── restore.e2e.js      # 临时复电单: 结束许可→解牌合闸/剩余许可隔离/回滚/单审计/409 回归
     ├── advice.e2e.js       # 单设备隔离建议最少挂牌/空步骤/不可行/建议带入单据/409 回归
     ├── group.e2e.js        # 多设备协同方案/预演/一次确认/重复许可/不可行/单审计回归
     ├── advisor.test.js     # 单/多设备隔离建议单元测试(最小割、共用开关、无开关旁路等)
@@ -550,6 +680,10 @@ node test/smoke.js
 
 # 临时操作单回归(预演只读/确认原子/逐步失败不可补救/整单回滚/单次修订号/409)
 BASE=http://127.0.0.1:3100 node test/orders.e2e.js
+
+# 临时复电单回归(不存在/已结束/重复结束许可拒绝/结束必须在前/剩余许可隔离/
+#                 逐步失败不可补救/整单回滚/单次修订号与单审计/STALE_REVISION)
+BASE=http://127.0.0.1:3100 node test/restore.e2e.js
 
 # 隔离建议回归(最少新增挂牌/已隔离空步骤/无开关通路 422/建议带入预演确认/409/只读不审计)
 BASE=http://127.0.0.1:3100 node test/advice.e2e.js

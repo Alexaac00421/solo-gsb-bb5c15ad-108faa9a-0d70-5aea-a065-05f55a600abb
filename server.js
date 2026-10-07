@@ -18,6 +18,13 @@ const {
 } = require('./src/orders');
 const { planIsolation, planGroupIsolation } = require('./src/advisor');
 const { singlePointTagRisk } = require('./src/tagrisk');
+const {
+  normalizeRestoreSteps,
+  simulateRestore,
+  commitRestore,
+  remainingReport,
+  ACTION_LABEL: RESTORE_ACTION_LABEL
+} = require('./src/restore');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -804,6 +811,85 @@ app.post('/api/orders/confirm', wrap((req, res) => {
   });
 }));
 
+// ---------------------------------------------------------------------------
+// 临时复电单 —— 仅操作员; 先按序结束有效许可, 再解牌 / 合闸; 预演只读, 确认原子
+// ---------------------------------------------------------------------------
+
+// 查任意状态的许可(含已结束), 供复电单结构校验区分“不存在”与“已结束”。
+const findPermitById = db.prepare(
+  `SELECT p.*, n.name AS device_name
+     FROM permits p JOIN nodes n ON n.id = p.device_id
+    WHERE p.id = ?`
+);
+
+// 预演: 不校验/递增修订号, 不写任何库; 永远基于当前状态推演并返回当前修订号。
+app.post('/api/restore-orders/preview', wrap((req, res) => {
+  requireOperator(req.body || {});
+  // 图、有效许可、修订号取自同一只读快照
+  const snap = db.transaction(() => ({
+    graph: loadGraph(),
+    permits: activePermits(),
+    revision: currentRevision()
+  }))();
+  const steps = normalizeRestoreSteps(snap.graph,
+    (id) => findPermitById.get(id), req.body?.steps);
+  const simulation = simulateRestore(snap.graph, snap.permits, steps);
+  res.json({
+    ok: true,
+    kind: 'restoreOrder.preview',
+    revision: snap.revision,
+    success: simulation.success,
+    failedStep: simulation.failedStep,
+    error: simulation.error,
+    // 执行前的全部有效许可及其隔离结果(均为隔离满足, 否则系统 invariant 已破坏)
+    remainingPermits: remainingReport(snap.graph, snap.permits),
+    ended_permit_ids: steps.filter((s) => s.action === 'endPermit').map((s) => s.permit_id),
+    steps: simulation.steps
+  });
+}));
+
+// 确认: STALE_REVISION / 角色 / 事务回滚 / 单次修订号递增 / 整单一条审计, 均沿用既有约定。
+app.post('/api/restore-orders/confirm', wrap((req, res) => {
+  runMutation(res, {
+    body: req.body, action: 'restoreOrder.confirm', requireRole: 'operator',
+    skipPermitCheck: true, // 整单隔离保护在逐步推演中逐次完成, 等价且更精确
+    mutate: ({ detail, result }) => {
+      const graph = loadGraph();
+      const steps = normalizeRestoreSteps(graph,
+        (id) => findPermitById.get(id), req.body?.steps);
+      const actor = req.body.actor.trim();
+
+      const simulation = simulateRestore(graph, activePermits(), steps);
+      if (!simulation.success) {
+        const f = simulation.steps[simulation.failedStep - 1];
+        // 隔离失败在 violations 中携带受影响许可与实际带电路径; 其余状态机错误给步骤序号
+        throw new OrderError(422, f.error.code,
+          `第 ${simulation.failedStep} 步执行失败: ${f.error.message}`,
+          {
+            step: simulation.failedStep,
+            step_name: RESTORE_ACTION_LABEL[f.action],
+            step_results: simulation.steps,
+            ended_permit_ids: steps.filter((s) => s.action === 'endPermit').map((s) => s.permit_id),
+            ...(f.violations ? { violations: f.violations } : {}),
+            ...(f.permit_id !== undefined ? {
+              permit_id: f.permit_id,
+              device_id: f.device_id,
+              device_name: f.device_name
+            } : {})
+          });
+      }
+
+      const committed = commitRestore(db, steps, actor);
+      detail.steps = committed;
+      detail.ended_permit_ids = committed
+        .filter((c) => c.action === 'endPermit').map((c) => c.permit_id);
+      detail.switch_step_count = committed.length - detail.ended_permit_ids.length;
+      result.steps = committed;
+      result.ended_permit_ids = detail.ended_permit_ids;
+    }
+  });
+}));
+
 // 协同隔离预演: 服务器基于当前状态重新计算方案, 不校验/递增修订号、不写库。
 app.post('/api/isolation-group/preview', wrap((req, res) => {
   requireOperator(req.body || {});
@@ -916,6 +1002,7 @@ app.use((err, req, res, next) => {
     if (err.infeasibleDevices) body.infeasibleDevices = err.infeasibleDevices;
     if (err.plan) body.plan = err.plan;
     if (err.truncated) body.truncated = err.truncated;
+    if (err.ended_permit_ids) body.ended_permit_ids = err.ended_permit_ids;
     if (err.step !== undefined) {
       body.step = err.step;
       body.step_name = err.step_name;

@@ -81,6 +81,36 @@
         </div>
         <div id="tagRiskResult" class="tagrisk-result"></div>
       </div>
+
+      <!-- 临时复电单(检修结束) -->
+      <div class="panel" id="restorePanel">
+        <h3>临时复电单（检修结束：先结束许可，再解牌 / 合闸）</h3>
+        <p class="hint">检修结束时按序编排：先依次 <b>结束指定的有效许可</b>，全部许可步结束后才能对选定开关
+          <b>解牌 untag</b>、<b>合闸 close</b>。预演为纯只读，逐步展示前后开关状态、失败位置及
+          “剩余有效许可”的隔离结论；确认时按原顺序逐步校验，任一步使剩余许可出现带电通路即整单回滚
+          （后续步骤不能补救），并返回受影响许可与真实带电路径。</p>
+        <div class="form-row">
+          <select id="restoreAction">
+            <option value="endPermit">结束许可 endPermit</option>
+            <option value="untag">解牌 untag</option>
+            <option value="close">合闸 close</option>
+          </select>
+          <select id="restoreTarget"></select>
+          <button id="restoreAddBtn" class="btn btn-primary">加入步骤</button>
+        </div>
+        <table class="grid" id="restoreGrid">
+          <thead><tr><th>#</th><th>动作</th><th>目标</th><th>操作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="form-row" style="margin-top:12px">
+          <button id="restorePreviewBtn" class="btn btn-warn">预演</button>
+          <button id="restoreConfirmBtn" class="btn btn-success">确认执行</button>
+          <button id="restoreClearBtn" class="btn">清空</button>
+        </div>
+        <div id="restoreResult" class="order-result">
+          <p class="hint">先加入步骤，点击“预演”查看各步前后状态、失败位置及剩余有效许可的隔离结果。</p>
+        </div>
+      </div>
     </section>
 
     <!-- 临时操作单 -->
