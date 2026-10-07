@@ -25,6 +25,11 @@ const state = {
   tagRisk: {
     excluded: new Set(), // 生成报告时被排除的有效许可 id(默认全选=检查全部)
     report: null         // 最近一次单点挂牌失效风险报告
+  },
+  restoration: {
+    steps: [],           // 浏览器临时编排的复电单, 不落库: {action, permit_id|node_id}
+    result: null,        // 最近一次预演/确认结果
+    kind: null           // 'preview' | 'confirm'
   }
 };
 
@@ -35,10 +40,11 @@ const ACTION_LABELS = {
   'switch.tag': '开关挂牌', 'switch.untag': '开关解牌',
   'permit.apply': '申请检修许可', 'permit.end': '结束检修许可',
   'order.confirm': '临时操作单执行',
+  'restoration.confirm': '临时复电单执行',
   'isolationGroup.confirm': '多设备协同隔离整组许可'
 };
 const ORDER_ACTION_LABEL = {
-  open: '分闸', close: '合闸', tag: '挂牌', untag: '解牌', permit: '申请许可'
+  open: '分闸', close: '合闸', tag: '挂牌', untag: '解牌', permit: '申请许可', end: '结束许可'
 };
 const KIND_LABELS = { source: '电源', switch: '开关', device: '设备' };
 
@@ -97,8 +103,12 @@ async function mutate(method, url, payload, opts = {}) {
         ? '\n原协同方案基于旧修订号，已标记为 STALE，不会自动改用新方案。' : ''), 'error');
     return null;
   }
-  // 操作单确认失败: 保留步骤明细供结果区展示
-  lastOrderError = data.step !== undefined ? data : null;
+  // 操作单 / 复电单确认失败: 保留步骤明细供结果区展示
+  if (opts.tag === 'restoration-confirm') {
+    lastRestorationError = data.step !== undefined ? data : null;
+  } else {
+    lastOrderError = data.step !== undefined ? data : null;
+  }
   handleBusinessError(data);
   return null;
 }
@@ -557,6 +567,181 @@ async function tagRiskReport() {
     data.riskCount ? 'error' : 'success');
 }
 
+
+// ---------------------------------------------------------------------------
+// 临时复电单(检修结束): 编排 -> 只读预演 -> 确认原子执行
+// ---------------------------------------------------------------------------
+function restoreTargetName(snap, step) {
+  if (step.action === 'end') {
+    const p = snap.permits.find((x) => x.id === step.permit_id);
+    return p ? `许可 #${p.id} ${p.device_name}` : `许可 #${step.permit_id}（已不存在或已结束）`;
+  }
+  const n = snap.nodes.find((x) => x.id === step.node_id);
+  return n ? n.name : `开关 #${step.node_id}（已不存在）`;
+}
+
+// 目标下拉随动作切换: 结束许可选有效许可, 解牌/合闸选开关
+function refreshRestoreTargets() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  const action = $('restoreAction').value;
+  const box = $('restoreTarget');
+  if (action === 'end') {
+    box.innerHTML = snap.permits.length
+      ? snap.permits.map((p) =>
+          `<option value="${p.id}">#${p.id} ${escapeHtml(p.device_name)}（申请人：${escapeHtml(p.requested_by)}）</option>`).join('')
+      : '<option value="">（当前没有有效许可）</option>';
+  } else {
+    box.innerHTML = snap.nodes.filter((n) => n.kind === 'switch')
+      .map((n) => `<option value="${n.id}">${escapeHtml(n.name)}（${n.open_pos ? '分闸' : '合闸'}${n.tagged ? '·🔒挂牌' : ''}）</option>`)
+      .join('');
+  }
+}
+
+// 复电单顺序约束: 结束许可步必须全部在解牌/合闸之前
+function canonicalizeRestoreSteps() {
+  const ends = state.restoration.steps.filter((s) => s.action === 'end');
+  const switches = state.restoration.steps.filter((s) => s.action !== 'end');
+  state.restoration.steps = [...ends, ...switches];
+}
+
+function renderRestoreEditor() {
+  const snap = state.snapshot;
+  if (!snap) return;
+  refreshRestoreTargets();
+  const tbody = $('restoreGrid').querySelector('tbody');
+  if (!state.restoration.steps.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="hint">还没有步骤。</td></tr>';
+    return;
+  }
+  tbody.innerHTML = state.restoration.steps.map((s, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td>${ORDER_ACTION_LABEL[s.action]} <span class="hint">${s.action}</span></td>
+      <td>${escapeHtml(restoreTargetName(snap, s))}</td>
+      <td>
+        <button class="btn btn-sm" data-restore="up" data-idx="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn btn-sm" data-restore="down" data-idx="${i}" ${i === state.restoration.steps.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn btn-sm btn-danger" data-restore="del" data-idx="${i}">删除</button>
+      </td>
+    </tr>`).join('');
+}
+
+function renderRemainingPermits(remaining) {
+  if (!Array.isArray(remaining)) return '';
+  if (!remaining.length) return '<div class="hint">剩余有效许可：无（全部已结束）。</div>';
+  const items = remaining.map((p) => p.isolated
+    ? `<span class="restore-rem ok">✔ #${p.permit_id} ${escapeHtml(p.device_name)}</span>`
+    : `<span class="restore-rem bad">✖ #${p.permit_id} ${escapeHtml(p.device_name)}</span>`).join(' ');
+  return `<div class="restore-remaining">剩余有效许可 ${remaining.length} 张：${items}</div>`;
+}
+
+function renderRestoreResult() {
+  const box = $('restoreResult');
+  const o = state.restoration;
+  if (!box) return;
+  if (!o.result) {
+    box.innerHTML = '<p class="hint">先在上方编排步骤，点击“预演”查看每步前后状态、失败位置与剩余许可隔离结果。</p>';
+    return;
+  }
+
+  const headKind = o.kind === 'confirm' ? '确认复电' : '复电预演';
+  const r = o.result;
+  const head = r.success
+    ? `<div class="order-head ok">✔ ${headKind}通过：全部 ${r.steps.filter((s) => !s.skipped).length} 步均可执行${
+      o.kind === 'confirm' ? `，已原子落库（新修订号 ${r.revision}）` : '（预演不改变真实状态、修订号或审计）'}</div>`
+    : `<div class="order-head bad">✖ ${headKind}在第 ${r.failedStep} 步失败：${escapeHtml(r.error ? r.error.message : '')}
+        <div class="hint">整单${o.kind === 'confirm' ? '已回滚，未写入任何数据（状态、修订号、审计均不变）' : '预演中止'}；后续步骤标记为“未执行”，不能补救前一步违规。</div></div>`;
+
+  box.innerHTML = head + r.steps.map((s) => {
+    const cls = s.skipped ? 'skipped' : s.ok ? 'ok' : 'bad';
+    const target = s.action === 'end'
+      ? `许可 #${s.permit_id}（${escapeHtml(s.device_name || '')}）`
+      : `开关「${escapeHtml(s.name || '')}」 #${s.node_id}`;
+    let pathsHtml = '';
+    const paths = [];
+    if (s.violations) s.violations.forEach((v) => paths.push(...v.livePaths));
+    if (paths.length) {
+      pathsHtml = paths.slice(0, 5).map((p) =>
+        `<div class="path-line">带电：${p.nodes.map((n) => n.tagged ? `🔒${n.name}` : n.name).join(' → ')}</div>`).join('')
+        + (paths.length > 5 ? `<div class="hint">…另有 ${paths.length - 5} 条。</div>` : '');
+    }
+    return `<div class="order-step ${cls}">
+      <b>第 ${s.step} 步</b> · ${ORDER_ACTION_LABEL[s.action]} · ${target}
+      ${s.before && s.action !== 'end' ? `${stateBadge(s.before)} → ${stateBadge(s.after)}` : ''}
+      ${s.action === 'end' ? '<span class="hint">[有效] → [已结束]</span>' : ''}
+      <div>${s.skipped ? '⏭ ' : s.ok ? '✔ ' : '✖ '}${escapeHtml(s.message || (s.error ? s.error.message : ''))}</div>
+      ${renderRemainingPermits(s.remainingPermits)}
+      ${pathsHtml}
+    </div>`;
+  }).join('');
+
+  // 失败时在网络图上高亮实际带电路径
+  if (!r.success) {
+    const paths = [];
+    r.steps.forEach((s) => {
+      if (s.violations) s.violations.forEach((v) => paths.push(...v.livePaths));
+    });
+    if (paths.length) {
+      state.highlightPaths = paths.map((p) => p.nodes.map((n) => n.id));
+      renderGraph();
+    }
+  }
+}
+
+async function restorationPreview() {
+  if (!state.restoration.steps.length) return toast('请先编排至少一个步骤', 'error');
+  const r = await fetch('/api/restoration/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      actor: state.actor, role: state.role,
+      revision: state.snapshot ? state.snapshot.revision : 1,
+      steps: state.restoration.steps
+    })
+  });
+  const data = await r.json().catch(() => ({}));
+  if (r.ok) {
+    state.restoration.result = data;
+    state.restoration.kind = 'preview';
+    renderRestoreResult();
+    toast(data.success
+      ? '复电预演通过（真实状态、有效许可、修订号与审计均未改变）'
+      : `预演显示第 ${data.failedStep} 步将被拒绝`, data.success ? 'success' : 'error');
+    return;
+  }
+  // 结构/身份类错误直接提示
+  toast(`✖ ${data.error ? data.error.message : '预演请求失败'}`, 'error');
+}
+
+async function restorationConfirm() {
+  if (!state.restoration.steps.length) return toast('请先编排至少一个步骤', 'error');
+  if (!confirm(`确认按当前顺序执行这 ${state.restoration.steps.length} 个复电步骤？\n任一步失败整单回滚、不落库（修订号与审计均不变）。`)) return;
+  const data = await mutate('POST', '/api/restoration/confirm',
+    { steps: state.restoration.steps }, { tag: 'restoration-confirm' });
+  if (data) {
+    state.restoration.result = {
+      success: true, failedStep: null, error: null,
+      revision: data.revision, steps: data.step_results || []
+    };
+    state.restoration.kind = 'confirm';
+    state.restoration.steps = [];
+    renderRestoreEditor();
+    renderRestoreResult();
+  } else if (lastRestorationError) {
+    state.restoration.result = {
+      success: false,
+      failedStep: lastRestorationError.step,
+      error: lastRestorationError.error,
+      steps: lastRestorationError.step_results
+    };
+    state.restoration.kind = 'confirm';
+    renderRestoreResult();
+  }
+}
+
+// 供 restorationConfirm 读取最近一次确认失败的步骤明细
+let lastRestorationError = null;
 
 // ---------------------------------------------------------------------------
 // 隔离建议: 最少新增挂牌方案(基于所给修订号, 可带入临时操作单预演/确认)
@@ -1205,6 +1390,8 @@ function render() {
   renderPermits();
   renderTagRiskPermits();
   renderTagRiskResult();
+  renderRestoreEditor();
+  renderRestoreResult();
   renderAdmin();
   renderGroupDevices();
   renderGroupPlan();
@@ -1263,6 +1450,7 @@ document.addEventListener('click', (ev) => {
   if (!actionable) return;
   const mutating = actionable.id && ['addNodeBtn', 'addEdgeBtn', 'applyBtn',
       'orderAddBtn', 'orderPreviewBtn', 'orderConfirmBtn',
+      'restoreAddBtn', 'restorePreviewBtn', 'restoreConfirmBtn', 'restoreFillBtn',
       'groupPreviewBtn', 'groupConfirmBtn'].includes(actionable.id)
     || actionable.hasAttribute('data-admin')
     || actionable.closest('#nodeActions')
@@ -1331,6 +1519,73 @@ $('orderGrid').addEventListener('click', (ev) => {
 });
 $('orderPreviewBtn').addEventListener('click', orderPreview);
 $('orderConfirmBtn').addEventListener('click', orderConfirm);
+
+// 临时复电单事件
+$('restoreAction').addEventListener('change', refreshRestoreTargets);
+$('restoreAddBtn').addEventListener('click', () => {
+  const action = $('restoreAction').value;
+  const target = parseInt($('restoreTarget').value, 10);
+  if (!Number.isInteger(target)) {
+    return toast(action === 'end' ? '当前没有可结束的有效许可' : '没有可选开关', 'error');
+  }
+  const steps = state.restoration.steps;
+  if (action === 'end') {
+    if (steps.some((s) => s.action === 'end' && s.permit_id === target)) {
+      return toast('该许可已在复电单中，不能重复结束', 'error');
+    }
+    steps.push({ action: 'end', permit_id: target });
+  } else {
+    steps.push({ action, node_id: target });
+  }
+  // 结束许可步统一保持在开关步之前(后端同样强制)
+  canonicalizeRestoreSteps();
+  state.restoration.result = null;
+  renderRestoreEditor();
+  renderRestoreResult();
+});
+$('restoreFillBtn').addEventListener('click', () => {
+  const snap = state.snapshot;
+  const steps = [
+    ...snap.permits.map((p) => ({ action: 'end', permit_id: p.id })),
+    ...snap.nodes.filter((n) => n.kind === 'switch' && n.tagged).map((n) => ({ action: 'untag', node_id: n.id }))
+  ];
+  if (!steps.length) return toast('当前没有有效许可或挂牌开关可填入', 'info');
+  state.restoration.steps = steps;
+  state.restoration.result = null;
+  renderRestoreEditor();
+  renderRestoreResult();
+  toast(`已填入 ${snap.permits.length} 个结束许可步与 `
+    + `${snap.nodes.filter((n) => n.kind === 'switch' && n.tagged).length} 个解牌步；`
+    + '合闸需逐台自行加入（合闸前该开关必须已解牌）。', 'info');
+});
+$('restoreGrid').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-restore]');
+  if (!btn) return;
+  const idx = parseInt(btn.dataset.idx, 10);
+  const steps = state.restoration.steps;
+  const op = btn.dataset.restore;
+  if (op === 'del') steps.splice(idx, 1);
+  if (op === 'up' && idx > 0) [steps[idx - 1], steps[idx]] = [steps[idx], steps[idx - 1]];
+  if (op === 'down' && idx < steps.length - 1) [steps[idx + 1], steps[idx]] = [steps[idx], steps[idx + 1]];
+  // 移动后若结束许可步落到开关步之后则纠正(后端同样强制), 并提示顺序规则
+  const firstSwitch = steps.findIndex((s) => s.action !== 'end');
+  const misplacedEnd = firstSwitch >= 0
+    ? steps.slice(firstSwitch + 1).some((s) => s.action === 'end') : false;
+  canonicalizeRestoreSteps();
+  if (misplacedEnd) toast('结束许可步必须排在解牌/合闸之前，已自动调整顺序。', 'info');
+  state.restoration.result = null;
+  renderRestoreEditor();
+  renderRestoreResult();
+});
+$('restorePreviewBtn').addEventListener('click', restorationPreview);
+$('restoreConfirmBtn').addEventListener('click', restorationConfirm);
+$('restoreClearBtn').addEventListener('click', () => {
+  state.restoration.steps = [];
+  state.restoration.result = null;
+  renderRestoreEditor();
+  renderRestoreResult();
+});
+
 $('groupPlanBtn').addEventListener('click', groupPlan);
 $('groupPreviewBtn').addEventListener('click', groupPreview);
 $('groupConfirmBtn').addEventListener('click', groupConfirm);

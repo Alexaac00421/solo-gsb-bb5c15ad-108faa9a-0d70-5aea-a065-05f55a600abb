@@ -18,6 +18,13 @@ const {
 } = require('./src/orders');
 const { planIsolation, planGroupIsolation } = require('./src/advisor');
 const { singlePointTagRisk } = require('./src/tagrisk');
+const {
+  RestorationError,
+  ACTION_LABEL: RESTORATION_ACTION_LABEL,
+  normalizeRestorationSteps,
+  simulateRestoration,
+  commitRestorationSteps
+} = require('./src/restoration');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.LOTO_DB || path.join(__dirname, 'data', 'loto.db');
@@ -76,6 +83,11 @@ function activePermits() {
       WHERE p.status = 'active'
       ORDER BY p.id`
   ).all();
+}
+
+// permits 表全部行(含已结束), 供复电单区分“许可不存在”与“许可已结束”
+function allPermitRows() {
+  return db.prepare(`SELECT id, status, device_id FROM permits ORDER BY id`).all();
 }
 
 function buildSnapshot() {
@@ -804,6 +816,70 @@ app.post('/api/orders/confirm', wrap((req, res) => {
   });
 }));
 
+// ---------------------------------------------------------------------------
+// 临时复电单(检修结束) —— 仅操作员; 先按序结束许可, 再解牌 / 合闸;
+// 预演只读, 确认原子执行(与临时操作单同一套约定)
+// ---------------------------------------------------------------------------
+
+// 预演: 不校验/递增修订号, 不写任何库; 永远基于当前状态推演并返回当前修订号。
+app.post('/api/restoration/preview', wrap((req, res) => {
+  requireOperator(req.body || {});
+  const snap = db.transaction(() => ({
+    graph: loadGraph(),
+    permits: activePermits(),
+    allPermits: allPermitRows(),
+    revision: currentRevision()
+  }))();
+  const steps = normalizeRestorationSteps(
+    snap.graph, snap.permits, snap.allPermits, req.body?.steps
+  );
+  const simulation = simulateRestoration(snap.graph, snap.permits, steps);
+  res.json({
+    ok: true,
+    kind: 'restoration.preview',
+    revision: snap.revision, // 预演所依据的修订号
+    success: simulation.success,
+    failedStep: simulation.failedStep,
+    error: simulation.error,
+    steps: simulation.steps
+  });
+}));
+
+// 确认: STALE_REVISION / 角色 / 事务回滚 / 单次修订号递增 / 整单一条审计,
+// 均沿用既有约定。结构校验在事务内完成(区分不存在 / 已结束的许可)。
+app.post('/api/restoration/confirm', wrap((req, res) => {
+  runMutation(res, {
+    body: req.body, action: 'restoration.confirm', requireRole: 'operator',
+    skipPermitCheck: true, // 整单隔离保护在逐步推演中对“剩余有效许可”逐次完成
+    mutate: ({ detail, result }) => {
+      const graph = loadGraph();
+      const permits = activePermits();
+      const steps = normalizeRestorationSteps(graph, permits, allPermitRows(), req.body?.steps);
+
+      const simulation = simulateRestoration(graph, permits, steps);
+      if (!simulation.success) {
+        const f = simulation.steps[simulation.failedStep - 1];
+        // 隔离失败(violations)携带受影响许可与至少一条真实带电路径
+        throw new RestorationError(422, f.error.code,
+          `第 ${simulation.failedStep} 步执行失败: ${f.error.message}`,
+          {
+            step: simulation.failedStep,
+            step_name: RESTORATION_ACTION_LABEL[f.action],
+            step_results: simulation.steps,
+            ...(f.violations ? { violations: f.violations } : {})
+          });
+      }
+
+      const committed = commitRestorationSteps(db, steps, req.body.actor.trim());
+      detail.ended_permit_ids = committed.filter((c) => c.action === 'end').map((c) => c.permit_id);
+      detail.steps = committed;
+      result.steps = committed;
+      result.step_results = simulation.steps;
+      result.ended_permit_ids = detail.ended_permit_ids;
+    }
+  });
+}));
+
 // 协同隔离预演: 服务器基于当前状态重新计算方案, 不校验/递增修订号、不写库。
 app.post('/api/isolation-group/preview', wrap((req, res) => {
   requireOperator(req.body || {});
@@ -902,7 +978,7 @@ app.post('/api/isolation-group/confirm', wrap((req, res) => {
 // 错误处理
 // ---------------------------------------------------------------------------
 app.use((err, req, res, next) => {
-  if (err instanceof ApiError || err instanceof OrderError) {
+  if (err instanceof ApiError || err instanceof OrderError || err instanceof RestorationError) {
     const body = { ok: false, error: { code: err.code, message: err.message } };
     // 错误体同样携带当前修订号: 建议/预演后状态已被他人改变时, 调用方按
     // STALE_REVISION 约定处理, 不自动改用新方案。

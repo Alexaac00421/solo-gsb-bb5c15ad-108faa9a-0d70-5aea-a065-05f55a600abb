@@ -9,7 +9,8 @@
     "start": "node server.js",
     "test:graph": "node test/graph.test.js",
     "test:advisor": "node test/advisor.test.js",
-    "test:tagrisk": "node test/tagrisk.test.js"
+    "test:tagrisk": "node test/tagrisk.test.js",
+    "test:restoration": "node test/restoration.e2e.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
